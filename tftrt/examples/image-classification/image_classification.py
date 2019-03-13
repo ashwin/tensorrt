@@ -18,7 +18,7 @@
 import argparse
 import os
 import tensorflow as tf
-import tensorflow.contrib.tensorrt as trt
+from tensorflow.python.compiler.tensorrt import trt_convert as trt
 import time
 import numpy as np
 import sys
@@ -164,12 +164,14 @@ def run(frozen_graph, model, data_files, batch_size,
         return features, labels
 
     # Evaluate model
-    if mode == 'validation':
-        num_records = get_tfrecords_count(data_files)
-    elif mode == 'benchmark':
-        num_records = len(data_files) 
-    else:
-        raise ValueError("Mode must be either 'validation' or 'benchmark'")
+    num_records = 100  # fake data
+    if not use_synthetic:
+      if mode == 'validation':
+          num_records = get_tfrecords_count(data_files)
+      elif mode == 'benchmark':
+          num_records = len(data_files) 
+      else:
+          raise ValueError("Mode must be either 'validation' or 'benchmark'")
     logger = LoggerHook(
         display_every=display_every,
         batch_size=batch_size,
@@ -511,7 +513,7 @@ def get_frozen_graph(
     model_dir=None,
     use_trt=False,
     use_dynamic_op=False,
-    precision='fp32',
+    precision='FP32',
     batch_size=8,
     minimum_segment_size=2,
     calib_files=None,
@@ -524,7 +526,7 @@ def get_frozen_graph(
 
     model: str, the model name (see NETS table in classification.py)
     use_trt: bool, if true, use TensorRT
-    precision: str, floating point precision (fp32, fp16, or int8)
+    precision: str, floating point precision (FP32, FP16, or INT8)
     batch_size: int, batch size for TensorRT optimizations
     returns: tensorflow.GraphDef, the TensorRT compatible frozen graph
     """
@@ -556,21 +558,28 @@ def get_frozen_graph(
     # Convert to TensorRT graph
     if use_trt:
         start_time = time.time()
-        frozen_graph = trt.create_inference_graph(
+        converter = trt.TrtGraphConverter(
             input_graph_def=frozen_graph,
-            outputs=['logits', 'classes'],
+            nodes_blacklist=['logits', 'classes'],
             max_batch_size=batch_size,
             max_workspace_size_bytes=max_workspace_size,
             precision_mode=precision.upper(),
             minimum_segment_size=minimum_segment_size,
             is_dynamic_op=use_dynamic_op
         )
+        frozen_graph = converter.convert()
         times['trt_conversion'] = time.time() - start_time
         num_nodes['tftrt_total'] = len(frozen_graph.node)
         num_nodes['trt_only'] = len([1 for n in frozen_graph.node if str(n.op)=='TRTEngineOp'])
         graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
-        if precision == 'int8':
+        if precision == 'INT8':
+            def feed_dict_fn():
+                if model == 'vgg_19' or model == 'mobilenet_v2':
+                    return {'input:0': np.random.random_sample([batch_size, 224, 224, 3])}
+                return None
+            frozen_graph = converter.calibrate(['logits', 'classes'], 3, feed_dict_fn=feed_dict_fn)
+        if False:
             calib_graph = frozen_graph
             graph_sizes['calib'] = len(calib_graph.SerializeToString())
             # INT8 calibration step
@@ -625,7 +634,7 @@ if __name__ == '__main__':
         help='If set, the graph will be converted to a TensorRT graph.')
     parser.add_argument('--use_trt_dynamic_op', action='store_true',
         help='If set, TRT conversion will be done using dynamic op instead of statically.')
-    parser.add_argument('--precision', type=str, choices=['fp32', 'fp16', 'int8'], default='fp32',
+    parser.add_argument('--precision', type=str, choices=['FP32', 'FP16', 'INT8'], default='FP32',
         help='Precision mode to use. FP16 and INT8 only work in conjunction with --use_trt')
     parser.add_argument('--batch_size', type=int, default=8,
         help='Number of images per batch.')
@@ -652,10 +661,10 @@ if __name__ == '__main__':
         help='If set, script will run for specified number of seconds.')
     args = parser.parse_args()
 
-    if args.precision != 'fp32' and not args.use_trt:
-        raise ValueError('TensorRT must be enabled for fp16 or int8 modes (--use_trt).')
-    if args.precision == 'int8' and not args.calib_data_dir and not args.use_synthetic:
-        raise ValueError('--calib_data_dir is required for int8 mode')
+    if args.precision != 'FP32' and not args.use_trt:
+        raise ValueError('TensorRT must be enabled for FP16 or INT8 modes (--use_trt).')
+    if args.precision == 'INT8' and not args.calib_data_dir and not args.use_synthetic:
+        raise ValueError('--calib_data_dir is required for INT8 mode')
     if args.num_iterations is not None and args.num_iterations <= args.num_warmup_iterations:
         raise ValueError('--num_iterations must be larger than --num_warmup_iterations '
             '({} <= {})'.format(args.num_iterations, args.num_warmup_iterations))
@@ -680,7 +689,11 @@ if __name__ == '__main__':
         data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
     else:
         raise ValueError("Mode must be either 'validation' or 'benchamark'")
-    calib_files = get_files(args.calib_data_dir, 'train*')
+
+    if args.use_synthetic:
+        calib_files = None
+    else:
+        calib_files = get_files(args.calib_data_dir, 'train*')
 
     frozen_graph, num_nodes, times, graph_sizes = get_frozen_graph(
         model=args.model,
