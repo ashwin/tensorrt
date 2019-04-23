@@ -16,9 +16,10 @@
 # =============================================================================
 
 import argparse
+import functools
 import os
 import tensorflow as tf
-import tensorflow.contrib.tensorrt as trt
+from tensorflow.python.compiler.tensorrt import trt_convert as trt
 import time
 import numpy as np
 import sys
@@ -38,12 +39,13 @@ class LoggerHook(tf.train.SessionRunHook):
         self.num_steps = (num_records + batch_size - 1) / batch_size
         self.batch_size = batch_size
 
-    def before_run(self, run_context):
+    def begin(self):
         self.start_time = time.time()
 
     def after_run(self, run_context, run_values):
         current_time = time.time()
         duration = current_time - self.start_time
+        self.start_time = current_time
         self.iter_times.append(duration)
         current_step = len(self.iter_times)
         if current_step % self.display_every == 0:
@@ -62,22 +64,61 @@ class BenchmarkHook(tf.train.SessionRunHook):
     def before_run(self, run_context):
         if not self.start_time:
             self.start_time = time.time()
-            if self.target_duration:
-                print("    running for target duration {} seconds from {}".format(
-                    self.target_duration, time.asctime(time.localtime(self.start_time))))
+            print("    running for target duration from %d", self.start_time)
 
     def after_run(self, run_context, run_values):
         if self.target_duration:
             current_time = time.time()
             if (current_time - self.start_time) > self.target_duration:
-                print("    target duration {} reached at {}, requesting stop".format(
-                    self.target_duration, time.asctime(time.localtime(current_time))))
+                print("    target duration %d reached at %d, requesting stop" % (self.target_duration, current_time))
                 run_context.request_stop()
 
         if self.iteration_limit:
             self.current_iteration += 1
             if self.current_iteration >= self.iteration_limit:
                 run_context.request_stop()
+
+# Define the dataset input function for tf.estimator.Estimator
+def input_fn(model, data_files, batch_size, use_synthetic, mode='validation'):
+    if use_synthetic:
+        input_width, input_height = get_netdef(model).get_input_dims()
+        features = np.random.normal(
+            loc=112, scale=70,
+            size=(batch_size, input_height, input_width, 3)).astype(np.float32)
+        features = np.clip(features, 0.0, 255.0)
+        features = tf.identity(tf.constant(features))
+        labels = np.random.randint(
+            low=0,
+            high=get_netdef(model).get_num_classes(),
+            size=(batch_size),
+            dtype=np.int32)
+        labels = tf.identity(tf.constant(labels))
+    else:
+        # preprocess function for input data
+        preprocess_fn = get_preprocess_fn(model, mode)
+
+        if mode == 'validation':
+            dataset = tf.data.TFRecordDataset(data_files)
+            dataset = dataset.apply(tf.contrib.data.map_and_batch(map_func=preprocess_fn, batch_size=batch_size, num_parallel_calls=8))
+            dataset = dataset.prefetch(buffer_size=tf.contrib.data.AUTOTUNE)
+            dataset = dataset.repeat(count=1)
+            iterator = dataset.make_one_shot_iterator()
+            features, labels = iterator.get_next()
+        elif mode == 'benchmark':
+            dataset = tf.data.Dataset.from_tensor_slices(data_files)
+            dataset = dataset.apply(tf.contrib.data.map_and_batch(map_func=preprocess_fn, batch_size=batch_size, num_parallel_calls=8))
+            dataset = dataset.repeat(count=1)
+            iterator = dataset.make_one_shot_iterator()
+            features = iterator.get_next()
+            labels = np.random.randint(
+                low=0,
+                high=get_netdef(model).get_num_classes(),
+                size=(batch_size),
+                dtype=np.int32)
+            labels = tf.identity(tf.constant(labels))
+        else:
+            raise ValueError("Mode must be either 'validation' or 'benchmark'")
+    return features, labels
 
 def run(frozen_graph, model, data_files, batch_size,
     num_iterations, num_warmup_iterations, use_synthetic, display_every=100,
@@ -116,9 +157,6 @@ def run(frozen_graph, model, data_files, batch_size,
                 loss=loss,
                 eval_metric_ops={'accuracy': accuracy})
 
-    # preprocess function for input data
-    preprocess_fn = get_preprocess_fn(model, mode)
-
     def get_tfrecords_count(files):
         num_records = 0
         for fn in files:
@@ -126,50 +164,8 @@ def run(frozen_graph, model, data_files, batch_size,
                 num_records += 1
         return num_records
 
-    # Define the dataset input function for tf.estimator.Estimator
-    def input_fn():
-        if use_synthetic:
-            input_width, input_height = get_netdef(model).get_input_dims()
-            features = np.random.normal(
-                loc=112, scale=70,
-                size=(batch_size, input_height, input_width, 3)).astype(np.float32)
-            features = np.clip(features, 0.0, 255.0)
-            labels = np.random.randint(
-                low=0,
-                high=get_netdef(model).get_num_classes(),
-                size=(batch_size),
-                dtype=np.int32)
-            with tf.device('/device:GPU:0'):
-                features = tf.identity(tf.constant(features))
-                labels = tf.identity(tf.constant(labels))
-        else:
-            if mode == 'validation':
-                dataset = tf.data.TFRecordDataset(data_files)
-                dataset = dataset.apply(tf.contrib.data.map_and_batch(map_func=preprocess_fn, batch_size=batch_size, num_parallel_calls=8))
-                dataset = dataset.prefetch(buffer_size=tf.contrib.data.AUTOTUNE)
-                dataset = dataset.repeat(count=1)
-                iterator = dataset.make_one_shot_iterator()
-                features, labels = iterator.get_next()
-            elif mode == 'benchmark':
-                dataset = tf.data.Dataset.from_tensor_slices(data_files)
-                dataset = dataset.apply(tf.contrib.data.map_and_batch(map_func=preprocess_fn, batch_size=batch_size, num_parallel_calls=8))
-                dataset = dataset.repeat(count=1)
-                iterator = dataset.make_one_shot_iterator()
-                features = iterator.get_next()
-                labels = np.random.randint(
-                    low=0,
-                    high=get_netdef(model).get_num_classes(),
-                    size=(batch_size),
-                    dtype=np.int32)
-                labels = tf.identity(tf.constant(labels))
-            else:
-                raise ValueError("Mode must be either 'validation' or 'benchmark'") 
-        return features, labels
-
     # Evaluate model
-    if use_synthetic:
-        num_records = num_iterations * batch_size
-    elif mode == 'validation':
+    if mode == 'validation':
         num_records = get_tfrecords_count(data_files)
     elif mode == 'benchmark':
         num_records = len(data_files) 
@@ -186,11 +182,12 @@ def run(frozen_graph, model, data_files, batch_size,
         config=tf.estimator.RunConfig(session_config=tf_config),
         model_dir='model_dir')
     results = {}
+    estimator_input_fn = functools.partial(input_fn, model, data_files, batch_size, use_synthetic, mode)
     if mode == 'validation':
-        results = estimator.evaluate(input_fn, steps=num_iterations, hooks=[logger])
+        results = estimator.evaluate(estimator_input_fn, steps=num_iterations, hooks=[logger])
     elif mode == 'benchmark':
         benchmark_hook = BenchmarkHook(target_duration=target_duration, iteration_limit=num_iterations)
-        prediction_results = [p for p in estimator.predict(input_fn, predict_keys=["classes"],  hooks=[logger, benchmark_hook])]
+        prediction_results = [p for p in estimator.predict(estimator_input_fn, predict_keys=["classes"],  hooks=[logger, benchmark_hook])]
     else:
         raise ValueError("Mode must be either 'validation' or 'benchmark'")
     # Gather additional results
@@ -199,8 +196,6 @@ def run(frozen_graph, model, data_files, batch_size,
     results['images_per_sec'] = np.mean(batch_size / iter_times)
     results['99th_percentile'] = np.percentile(iter_times, q=99, interpolation='lower') * 1000
     results['latency_mean'] = np.mean(iter_times) * 1000
-    results['latency_median'] = np.median(iter_times) * 1000
-    results['latency_min'] = np.min(iter_times) * 1000
     return results
 
 class NetDef(object):
@@ -361,15 +356,13 @@ def get_preprocess_fn(model, mode='validation'):
         input_width, input_height = net_def.get_input_dims()
         image = net_def.preprocess(image, input_width, input_height, is_training=False)
         return image
-    
+
     if mode == 'validation':
         return validation_process
     elif mode == 'benchmark':
         return benchmark_process
     else:
         raise ValueError("Mode must be either 'validation' or 'benchmark'")
-
-    
 
 def build_classification_graph(model, model_dir=None, default_models_dir='./data'):
     """Builds an image classification model by name
@@ -501,7 +494,7 @@ def download_checkpoint(model, destination_path):
     archive_path = os.path.join(destination_path,
                                 os.path.basename(get_netdef(model).url))
     if not os.path.isfile(archive_path):
-        subprocess.call(['wget', '--no-check-certificate', '-q',
+        subprocess.call(['wget', '--no-check-certificate',
                          get_netdef(model).url, '-O', archive_path])
     # Extract.
     subprocess.call(['tar', '-xzf', archive_path, '-C', destination_path])
@@ -517,9 +510,8 @@ def get_frozen_graph(
     model,
     model_dir=None,
     use_trt=False,
-    engine_dir=None,
     use_dynamic_op=False,
-    precision='fp32',
+    precision='FP32',
     batch_size=8,
     minimum_segment_size=2,
     calib_files=None,
@@ -532,7 +524,7 @@ def get_frozen_graph(
 
     model: str, the model name (see NETS table in classification.py)
     use_trt: bool, if true, use TensorRT
-    precision: str, floating point precision (fp32, fp16, or int8)
+    precision: str, floating point precision (FP32, FP16, or INT8)
     batch_size: int, batch size for TensorRT optimizations
     returns: tensorflow.GraphDef, the TensorRT compatible frozen graph
     """
@@ -564,43 +556,35 @@ def get_frozen_graph(
     # Convert to TensorRT graph
     if use_trt:
         start_time = time.time()
-        frozen_graph = trt.create_inference_graph(
+        converter = trt.TrtGraphConverter(
             input_graph_def=frozen_graph,
-            outputs=['logits', 'classes'],
+            nodes_blacklist=['logits', 'classes'],
             max_batch_size=batch_size,
             max_workspace_size_bytes=max_workspace_size,
             precision_mode=precision.upper(),
             minimum_segment_size=minimum_segment_size,
             is_dynamic_op=use_dynamic_op
         )
+        frozen_graph = converter.convert()
         times['trt_conversion'] = time.time() - start_time
         num_nodes['tftrt_total'] = len(frozen_graph.node)
         num_nodes['trt_only'] = len([1 for n in frozen_graph.node if str(n.op)=='TRTEngineOp'])
         graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
-        if engine_dir:
-            segment_number = 0
-            for node in frozen_graph.node:
-                if node.op == "TRTEngineOp":
-                    engine = node.attr["serialized_segment"].s
-                    engine_path = engine_dir+'/{}_{}_{}_segment{}.trtengine'.format(model, precision, batch_size, segment_number)
-                    segment_number += 1
-                    with open(engine_path, "wb") as f:
-                        f.write(engine)
-
         if precision == 'INT8':
             calib_graph = frozen_graph
             graph_sizes['calib'] = len(calib_graph.SerializeToString())
+
+            def input_map_fn():
+                features, _ = input_fn(model, calib_files, batch_size, use_synthetic)
+                return {'input:0': features}
+
             # INT8 calibration step
             print('Calibrating INT8...')
             start_time = time.time()
-            run(calib_graph, model, calib_files, batch_size,
-                num_calib_inputs // batch_size, 0, use_synthetic=use_synthetic)
+            frozen_graph = converter.calibrate(['logits', 'classes'], num_calib_inputs // batch_size, input_map_fn=input_map_fn)
             times['trt_calibration'] = time.time() - start_time
 
-            start_time = time.time()
-            frozen_graph = trt.calib_graph_to_infer_graph(calib_graph)
-            times['trt_int8_conversion'] = time.time() - start_time
             # This is already set but overwriting it here to ensure the right size
             graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
@@ -628,7 +612,7 @@ if __name__ == '__main__':
                  'resnet_v1_50', 'resnet_v2_50', 'resnet_v2_152', 'vgg_16', 'vgg_19',
                  'inception_v3', 'inception_v4'],
         help='Which model to use.')
-    parser.add_argument('--data_dir', type=str, default=None,
+    parser.add_argument('--data_dir', type=str,
         help='Directory containing validation set TFRecord files.')
     parser.add_argument('--calib_data_dir', type=str,
         help='Directory containing TFRecord files for calibrating int8.')
@@ -641,9 +625,6 @@ if __name__ == '__main__':
              'loaded from if --model_dir is not provided.')
     parser.add_argument('--use_trt', action='store_true',
         help='If set, the graph will be converted to a TensorRT graph.')
-    parser.add_argument('--engine_dir', type=str, default=None,
-        help='Directory where to write trt engines. Engines are written only if the directory ' \
-             'is provided. This option is ignored when not using tf_trt.')
     parser.add_argument('--use_trt_dynamic_op', action='store_true',
         help='If set, TRT conversion will be done using dynamic op instead of statically.')
     parser.add_argument('--precision', type=str, choices=['FP32', 'FP16', 'INT8'], default='FP32',
@@ -674,7 +655,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.precision != 'FP32' and not args.use_trt:
-        raise ValueError('TensorRT must be enabled for fp16 or INT8 modes (--use_trt).')
+        raise ValueError('TensorRT must be enabled for FP16 or INT8 modes (--use_trt).')
     if args.precision == 'INT8' and not args.calib_data_dir and not args.use_synthetic:
         raise ValueError('--calib_data_dir is required for INT8 mode')
     if args.num_iterations is not None and args.num_iterations <= args.num_warmup_iterations:
@@ -685,10 +666,6 @@ if __name__ == '__main__':
             '({} <= {})'.format(args.num_calib_inputs, args.batch_size))
     if args.mode == 'validation' and args.use_synthetic:
         raise ValueError('Cannot use both validation mode and synthetic dataset')
-    if args.data_dir is None and not args.use_synthetic:
-        raise ValueError("--data_dir required if you are not using synthetic data")
-    if args.use_synthetic and args.num_iterations is None:
-        raise ValueError("--num_iterations is required for --use_synthetic")
 
     def get_files(data_dir, filename_pattern):
         if data_dir == None:
@@ -699,22 +676,21 @@ if __name__ == '__main__':
                              'pattern "{}"'.format(data_dir, filename_pattern))
         return files
 
-    calib_files = []
-    data_files = []
-    if not args.use_synthetic:
-        if args.mode == "validation":
-            data_files = get_files(args.data_dir, 'validation*')
-        elif args.mode == "benchmark":    
-            data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
-        else:
-            raise ValueError("Mode must be either 'validation' or 'benchamark'")
-        calib_files = get_files(args.calib_data_dir, 'train*')
+    if args.use_synthetic:
+        data_files = []
+    elif args.mode == "validation":
+        data_files = get_files(args.data_dir, 'validation*')
+    elif args.mode == "benchmark":
+        data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
+    else:
+        raise ValueError("Mode must be either 'validation' or 'benchamark'")
+
+    calib_files = get_files(args.calib_data_dir, 'train*')
 
     frozen_graph, num_nodes, times, graph_sizes = get_frozen_graph(
         model=args.model,
         model_dir=args.model_dir,
         use_trt=args.use_trt,
-        engine_dir=args.engine_dir,
         use_dynamic_op=args.use_trt_dynamic_op,
         precision=args.precision,
         batch_size=args.batch_size,
@@ -757,8 +733,6 @@ if __name__ == '__main__':
     if args.mode == 'validation':
         print('    accuracy: %.2f' % (results['accuracy'] * 100))
     print('    images/sec: %d' % results['images_per_sec'])
-    print('    99th_percentile(ms): %.2f' % results['99th_percentile'])
+    print('    99th_percentile(ms): %.1f' % results['99th_percentile'])
     print('    total_time(s): %.1f' % results['total_time'])
-    print('    latency_mean(ms): %.2f' % results['latency_mean'])
-    print('    latency_median(ms): %.2f' % results['latency_median'])
-    print('    latency_min(ms): %.2f' % results['latency_min'])
+    print('    latency_mean(ms): %.1f' % results['latency_mean'])
