@@ -147,7 +147,7 @@ def run(frozen_graph, model, data_files, batch_size,
             return_elements=['logits:0', 'classes:0'],
             name='')
         if mode == tf.estimator.ModeKeys.PREDICT:
-            return tf.estimator.EstimatorSpec(mode=mode, 
+            return tf.estimator.EstimatorSpec(mode=mode,
                       predictions={'classes': classes_out})
         if mode == tf.estimator.ModeKeys.EVAL:
             loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits_out)
@@ -168,7 +168,7 @@ def run(frozen_graph, model, data_files, batch_size,
     if mode == 'validation':
         num_records = get_tfrecords_count(data_files)
     elif mode == 'benchmark':
-        num_records = len(data_files) 
+        num_records = len(data_files)
     else:
         raise ValueError("Mode must be either 'validation' or 'benchmark'")
     logger = LoggerHook(
@@ -685,7 +685,7 @@ if __name__ == '__main__':
     else:
         raise ValueError("Mode must be either 'validation' or 'benchamark'")
 
-    calib_files = get_files(args.calib_data_dir, 'train*')
+    calib_files = get_files(args.calib_data_dir, 'validation*')
 
     frozen_graph, num_nodes, times, graph_sizes = get_frozen_graph(
         model=args.model,
