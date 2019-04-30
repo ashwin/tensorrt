@@ -18,6 +18,7 @@
 import argparse
 import functools
 import os
+import json
 import tensorflow as tf
 from tensorflow.python.compiler.tensorrt import trt_convert as trt
 import time
@@ -515,22 +516,29 @@ def get_frozen_graph(
     batch_size=8,
     minimum_segment_size=2,
     calib_files=None,
+    in_calib_tables=None,
     num_calib_inputs=None,
     use_synthetic=False,
     cache=False,
     default_models_dir='./data',
     max_workspace_size=(1<<32)):
-    """Retreives a frozen GraphDef from model definitions in classification.py and applies TF-TRT
+    """Retrieves a frozen GraphDef from model definitions in classification.py and applies TF-TRT
 
-    model: str, the model name (see NETS table in classification.py)
-    use_trt: bool, if true, use TensorRT
-    precision: str, floating point precision (FP32, FP16, or INT8)
-    batch_size: int, batch size for TensorRT optimizations
-    returns: tensorflow.GraphDef, the TensorRT compatible frozen graph
+    Args:
+      model: str, the model name (see NETS table in classification.py)
+      use_trt: bool, if true, use TensorRT
+      precision: str, floating point precision (FP32, FP16, or INT8)
+      batch_size: int, batch size for TensorRT optimizations
+
+    Returns:
+      tensorflow.GraphDef, the TensorRT compatible frozen graph
+      Calibration tables, one per TRTEngineOp in the graph
     """
+
     num_nodes = {}
     times = {}
     graph_sizes = {}
+    out_calib_tables = {}
 
     # Load from pb file if frozen graph was already created and cached
     if cache:
@@ -572,24 +580,36 @@ def get_frozen_graph(
         graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
         if precision == 'INT8':
-            calib_graph = frozen_graph
-            graph_sizes['calib'] = len(calib_graph.SerializeToString())
+            if in_calib_tables:
+                calib_graph = frozen_graph
+                graph_sizes['calib'] = len(calib_graph.SerializeToString())
 
-            def input_map_fn():
-                features, _ = input_fn(model, calib_files, batch_size, use_synthetic)
-                return {'input:0': features}
+                frozen_graph = converter.set_calib_tables(in_calib_tables)
 
-            # INT8 calibration step
-            print('Calibrating INT8...')
-            start_time = time.time()
-            frozen_graph = converter.calibrate(['logits', 'classes'], num_calib_inputs // batch_size, input_map_fn=input_map_fn)
-            times['trt_calibration'] = time.time() - start_time
+                # This is already set but overwriting it here to ensure the right size
+                graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
-            # This is already set but overwriting it here to ensure the right size
-            graph_sizes['trt'] = len(frozen_graph.SerializeToString())
+                del calib_graph
+                print('INT8 graph created.')
+            else:
+                calib_graph = frozen_graph
+                graph_sizes['calib'] = len(calib_graph.SerializeToString())
 
-            del calib_graph
-            print('INT8 graph created.')
+                def input_map_fn():
+                    features, _ = input_fn(model, calib_files, batch_size, use_synthetic)
+                    return {'input:0': features}
+
+                # INT8 calibration step
+                print('Calibrating INT8...')
+                start_time = time.time()
+                frozen_graph, out_calib_tables = converter.calibrate(['logits', 'classes'], num_calib_inputs // batch_size, input_map_fn=input_map_fn)
+                times['trt_calibration'] = time.time() - start_time
+
+                # This is already set but overwriting it here to ensure the right size
+                graph_sizes['trt'] = len(frozen_graph.SerializeToString())
+
+                del calib_graph
+                print('INT8 graph created.')
 
     # Cache graph to avoid long conversions each time
     if cache:
@@ -603,7 +623,25 @@ def get_frozen_graph(
             f.write(frozen_graph.SerializeToString())
         times['saving_frozen_graph'] = time.time() - start_time
 
-    return frozen_graph, num_nodes, times, graph_sizes
+    return frozen_graph, out_calib_tables, num_nodes, times, graph_sizes
+
+def save_calib_tables(calib_tables, calib_table_fpath):
+    """Save calibration tables to JSON file."""
+    print('Saving calibration tables to:', calib_table_fpath)
+    with open(calib_table_fpath, 'wb') as ofile:
+        calib_tables_s = [s.decode('utf-8') for s in calib_tables]
+        json_s = json.dumps(calib_tables_s)
+        ofile.write(json_s.encode('utf-8'))
+
+def load_calib_tables(calib_table_fpath):
+    """Load calibration tables from JSON file."""
+    calib_tables = []
+    print('Loading calibration tables from:', calib_table_fpath)
+    with open(calib_table_fpath, 'rb') as ifile:
+        json_s = ifile.read()
+        calib_tables_s = json.loads(json_s)
+        calib_tables = [s.encode('utf-8') for s in calib_tables_s]
+    return calib_tables
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate model')
@@ -652,12 +690,16 @@ if __name__ == '__main__':
         help='Which mode to use (validation or benchmark)')
     parser.add_argument('--target_duration', type=int, default=None,
         help='If set, script will run for specified number of seconds.')
+    parser.add_argument('--save_calib_tables', type=str,
+        help='File to save calibration tables in')
+    parser.add_argument('--load_calib_tables', type=str,
+        help='File to load calibration tables from')
     args = parser.parse_args()
 
     if args.precision != 'FP32' and not args.use_trt:
         raise ValueError('TensorRT must be enabled for FP16 or INT8 modes (--use_trt).')
-    if args.precision == 'INT8' and not args.calib_data_dir and not args.use_synthetic:
-        raise ValueError('--calib_data_dir is required for INT8 mode')
+    if args.precision == 'INT8' and not args.calib_data_dir and not args.use_synthetic and not args.load_calib_tables:
+        raise ValueError('--calib_data_dir or --load_calib_tables is required for INT8 mode')
     if args.num_iterations is not None and args.num_iterations <= args.num_warmup_iterations:
         raise ValueError('--num_iterations must be larger than --num_warmup_iterations '
             '({} <= {})'.format(args.num_iterations, args.num_warmup_iterations))
@@ -683,11 +725,16 @@ if __name__ == '__main__':
     elif args.mode == "benchmark":
         data_files = [os.path.join(path, name) for path, _, files in os.walk(args.data_dir) for name in files]
     else:
-        raise ValueError("Mode must be either 'validation' or 'benchamark'")
+        raise ValueError("Mode must be either 'validation' or 'benchmark'")
 
     calib_files = get_files(args.calib_data_dir, 'validation*')
 
-    frozen_graph, num_nodes, times, graph_sizes = get_frozen_graph(
+    # Load calibration tables from user file
+    in_calib_tables = []
+    if args.load_calib_tables:
+        in_calib_tables = load_calib_tables(args.load_calib_tables)
+
+    frozen_graph, out_calib_tables, num_nodes, times, graph_sizes = get_frozen_graph(
         model=args.model,
         model_dir=args.model_dir,
         use_trt=args.use_trt,
@@ -696,11 +743,16 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         minimum_segment_size=args.minimum_segment_size,
         calib_files=calib_files,
+        in_calib_tables=in_calib_tables,
         num_calib_inputs=args.num_calib_inputs,
         use_synthetic=args.use_synthetic,
         cache=args.cache,
         default_models_dir=args.default_models_dir,
         max_workspace_size=args.max_workspace_size)
+
+    # Store calibration tables to user file
+    if args.save_calib_tables and out_calib_tables:
+        save_calib_tables(out_calib_tables, args.save_calib_tables)
 
     def print_dict(input_dict, str='', scale=None):
         for k, v in sorted(input_dict.items()):
