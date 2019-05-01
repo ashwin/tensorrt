@@ -1,4 +1,4 @@
-# Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
 #
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
@@ -95,7 +95,7 @@ def input_fn(model, data_files, batch_size, use_synthetic, mode='validation'):
             dtype=np.int32)
         labels = tf.identity(tf.constant(labels))
     else:
-        # preprocess function for input data
+        # Preprocess function for input data
         preprocess_fn = get_preprocess_fn(model, mode)
 
         if mode == 'validation':
@@ -325,11 +325,11 @@ def deserialize_image_record(record):
     with tf.name_scope('deserialize_image_record'):
         obj = tf.parse_single_example(record, feature_map)
         imgdata = obj['image/encoded']
-        label   = tf.cast(obj['image/class/label'], tf.int32)
-        bbox    = tf.stack([obj['image/object/bbox/%s'%x].values
-                            for x in ['ymin', 'xmin', 'ymax', 'xmax']])
+        label = tf.cast(obj['image/class/label'], tf.int32)
+        bbox = tf.stack([obj['image/object/bbox/%s'%x].values
+                         for x in ['ymin', 'xmin', 'ymax', 'xmax']])
         bbox = tf.transpose(tf.expand_dims(bbox, 0), [0,2,1])
-        text    = obj['image/class/text']
+        text = obj['image/class/text']
         return imgdata, label, bbox, text
 
 def get_preprocess_fn(model, mode='validation'):
@@ -409,7 +409,7 @@ def build_classification_graph(model, model_dir=None, default_models_dir='./data
             tf_saver = tf.train.Saver()
             tf_saver.restore(save_path=checkpoint_path, sess=tf_sess)
 
-            # freeze graph
+            # Freeze graph
             frozen_graph = tf.graph_util.convert_variables_to_constants(
                 tf_sess,
                 tf_sess.graph_def,
@@ -479,7 +479,7 @@ def find_checkpoint_in_dir(model_dir):
 
 
 def download_checkpoint(model, destination_path):
-    #copy files from source to destination (without any directories)
+    # Copy files from source to destination (without any directories)
     def copy_files(source, destination):
         try:
             shutil.copy2(source, destination)
@@ -532,7 +532,7 @@ def get_frozen_graph(
 
     Returns:
       tensorflow.GraphDef, the TensorRT compatible frozen graph
-      Calibration tables, one per TRTEngineOp in the graph
+      Calibration tables, one for each TRTEngineOp in the graph
     """
 
     num_nodes = {}
@@ -580,21 +580,14 @@ def get_frozen_graph(
         graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
         if precision == 'INT8':
+
+            calib_graph = frozen_graph
+            graph_sizes['calib'] = len(calib_graph.SerializeToString())
+
             if in_calib_tables:
-                calib_graph = frozen_graph
-                graph_sizes['calib'] = len(calib_graph.SerializeToString())
-
+                print('Setting calibration tables ...')
                 frozen_graph = converter.set_calib_tables(in_calib_tables)
-
-                # This is already set but overwriting it here to ensure the right size
-                graph_sizes['trt'] = len(frozen_graph.SerializeToString())
-
-                del calib_graph
-                print('INT8 graph created.')
             else:
-                calib_graph = frozen_graph
-                graph_sizes['calib'] = len(calib_graph.SerializeToString())
-
                 def input_map_fn():
                     features, _ = input_fn(model, calib_files, batch_size, use_synthetic)
                     return {'input:0': features}
@@ -605,11 +598,11 @@ def get_frozen_graph(
                 frozen_graph, out_calib_tables = converter.calibrate(['logits', 'classes'], num_calib_inputs // batch_size, input_map_fn=input_map_fn)
                 times['trt_calibration'] = time.time() - start_time
 
-                # This is already set but overwriting it here to ensure the right size
-                graph_sizes['trt'] = len(frozen_graph.SerializeToString())
+            # This is already set but overwriting it here to ensure the right size
+            graph_sizes['trt'] = len(frozen_graph.SerializeToString())
 
-                del calib_graph
-                print('INT8 graph created.')
+            del calib_graph
+            print('INT8 graph created.')
 
     # Cache graph to avoid long conversions each time
     if cache:
@@ -708,6 +701,12 @@ if __name__ == '__main__':
             '({} <= {})'.format(args.num_calib_inputs, args.batch_size))
     if args.mode == 'validation' and args.use_synthetic:
         raise ValueError('Cannot use both validation mode and synthetic dataset')
+
+    # Check calib tables file
+    if args.save_calib_tables and os.path.isfile(args.save_calib_tables):
+        raise ValueError('Calibration tables file already exists. Will not save to: {}'.format(args.save_calib_tables))
+    if args.load_calib_tables and not os.path.isfile(args.load_calib_tables):
+        raise ValueError('Calibration tables file does not exist. Cannot load from: {}'.format(args.load_calib_tables))
 
     def get_files(data_dir, filename_pattern):
         if data_dir == None:
